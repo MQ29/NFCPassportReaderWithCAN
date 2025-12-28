@@ -88,8 +88,11 @@ public class PACEHandler {
         digestAlg = try paceInfo.getDigestAlgorithm()  // Either SHA-1 or SHA-256.
         keyLength = try paceInfo.getKeyLength()  // Get key length  the enc cipher. Either 128, 192, or 256.
 
-        paceKeyType = PACEHandler.MRZ_PACE_KEY_REFERENCE
-        paceKey = try createPaceKey( from: mrzKey )
+        paceKeyType = PACEHandler.CAN_PACE_KEY_REFERENCE
+        let cleanCAN = mrzKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        Logger.pace.debug("Using CAN for PACE: '\(cleanCAN)' length: \(cleanCAN.count)")
+
+        paceKey = try createPaceKey( from: cleanCAN )
         
         // Temporary logging
         Logger.pace.debug("doPace - inpit parameters" )
@@ -107,8 +110,13 @@ public class PACEHandler {
         _ = try await tagReader.sendMSESetATMutualAuth(oid: paceOID, keyType: paceKeyType)
             
         let decryptedNonce = try await self.doStep1()
+
         let ephemeralParams = try await self.doStep2(passportNonce: decryptedNonce)
+        defer { EVP_PKEY_free( ephemeralParams ) }
+
         let (ephemeralKeyPair, passportPublicKey) = try await self.doStep3KeyExchange(ephemeralParams: ephemeralParams)
+        defer { EVP_PKEY_free(ephemeralKeyPair); EVP_PKEY_free(passportPublicKey) }
+
         let (encKey, macKey) = try await self.doStep4KeyAgreement( pcdKeyPair: ephemeralKeyPair, passportPublicKey: passportPublicKey)
         try self.paceCompleted( ksEnc: encKey, ksMac: macKey )
         Logger.pace.debug("PACE SUCCESSFUL" )
@@ -248,21 +256,32 @@ public class PACEHandler {
     func doStep3KeyExchange(ephemeralParams: OpaquePointer) async throws -> (OpaquePointer, OpaquePointer) {
         Logger.pace.debug( "Doing PACE Step3 - Key Exchange")
 
-        // Generate ephemeral keypair from ephemeralParams
-        var ephKeyPair : OpaquePointer? = nil
-        let pctx = EVP_PKEY_CTX_new(ephemeralParams, nil)
-        EVP_PKEY_keygen_init(pctx)
-        EVP_PKEY_keygen(pctx, &ephKeyPair)
-        EVP_PKEY_CTX_free(pctx)
-                
+        // Create a new EC_KEY with the same group
+        guard let ephEcKey = EC_KEY_new() else {
+            throw NFCPassportReaderError.PACEError( "Step3 KeyEx", "Failed to create EC key" )
+        }
+        defer { EC_KEY_free(ephEcKey) }
+
+        guard
+            let ecParams = EVP_PKEY_get0_EC_KEY(ephemeralParams),
+            let group = EC_KEY_get0_group(ecParams),
+            EC_KEY_set_group(ephEcKey, group) == 1,
+            EC_KEY_generate_key(ephEcKey) == 1 else {
+            throw NFCPassportReaderError.PACEError( "Step3 KeyEx", "Failed to generate EC key" )
+        }
+
+        // Wrap the EC_KEY into an EVP_PKEY
+        var ephKeyPair = EVP_PKEY_new()
         guard let ephemeralKeyPair = ephKeyPair else {
             throw NFCPassportReaderError.PACEError( "Step3 KeyEx", "Unable to get create ephermeral key pair" )
         }
+        defer { EVP_PKEY_free(ephKeyPair) }
+
+        guard EVP_PKEY_set1_EC_KEY(ephemeralKeyPair, ephEcKey) == 1 else {
+            throw NFCPassportReaderError.PACEError( "Step3 KeyEx", "Failed to set ephemeral key pair private key" )
+        }
         
         Logger.pace.debug( "Generated Ephemeral key pair")
-
-        // We've finished with the ephemeralParams now - we can now free it
-        EVP_PKEY_free( ephemeralParams )
 
         guard let publicKey = OpenSSLUtils.getPublicKeyData( from: ephemeralKeyPair ) else {
             throw NFCPassportReaderError.PACEError( "Step3 KeyEx", "Unable to get public key from ephermeral key pair" )
@@ -279,6 +298,7 @@ public class PACEHandler {
         }
 
         Logger.pace.debug( "Received passports ephemeral public key - \(binToHexRep(passportEncodedPublicKey!, asArray: true))" )
+        defer { ephKeyPair = nil } // prevent free to return the value on success path
         return (ephemeralKeyPair, passportPublicKey)
     }
     
@@ -561,7 +581,7 @@ extension PACEHandler {
             throw NFCPassportReaderError.InvalidDataPassed("Unable to get public key data")
         }
 
-        let keyType = EVP_PKEY_base_id( key )
+        let keyType = EVP_PKEY_get_base_id( key )
         let tag : TKTLVTag
         if keyType == EVP_PKEY_DH || keyType == EVP_PKEY_DHX {
             tag = 0x84
@@ -582,13 +602,38 @@ extension PACEHandler {
     /// Computes a key seed based on an MRZ key
     /// - Parameter the mrz key
     /// - Returns a encoded key based on the mrz key that can be used for PACE
-    func createPaceKey( from mrzKey: String ) throws -> [UInt8] {
-        let buf: [UInt8] = Array(mrzKey.utf8)
-        let hash = calcSHA1Hash(buf)
+    func createPaceKey(from pw: String) throws -> [UInt8] {
+        let buf = [UInt8](pw.utf8)
+
+        let seed: [UInt8]
         
+        // For CAN (Polish ID), we use the raw UTF-8 bytes directly as the seed
+        // CAN is already the correct length (6 digits) and doesn't need hashing
+        if paceKeyType == PACEHandler.CAN_PACE_KEY_REFERENCE {
+            seed = buf
+            Logger.pace.debug("Using CAN directly as seed (no hashing): \(binToHexRep(seed, asArray:true))")
+        } else {
+            // For MRZ, we hash the input
+            switch digestAlg {
+            case "SHA-1":
+                seed = calcSHA1Hash(buf)
+            case "SHA-256":
+                seed = calcSHA256Hash(buf)
+            default:
+                throw NFCPassportReaderError.UnsupportedCipherAlgorithm
+            }
+            Logger.pace.debug("Using hashed seed: \(binToHexRep(seed, asArray:true))")
+        }
+
         let smskg = SecureMessagingSessionKeyGenerator()
-        let key = try smskg.deriveKey(keySeed: hash, cipherAlgName: cipherAlg, keyLength: keyLength, nonce: nil, mode: .PACE_MODE, paceKeyReference: paceKeyType)
-        return key
+        return try smskg.deriveKey(
+            keySeed: seed,
+            cipherAlgName: cipherAlg,
+            keyLength: keyLength,
+            nonce: nil,
+            mode: .PACE_MODE,
+            paceKeyReference: paceKeyType
+        )
     }
     
     /// Performs the ECDH PACE GM key agreement protocol by multiplying a private key with a public key
